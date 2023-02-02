@@ -1089,9 +1089,6 @@ def main():
 
     # finally, await last tasks and exit script
 
-    finish_time = time.time()
-    print('total time: {:.3}s'.format(finish_time - start_time))
-
 
 if __name__ == '__main__':
     main()

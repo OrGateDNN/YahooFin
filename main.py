@@ -6,8 +6,9 @@ import pandas as pd
 import numpy as np
 import re
 import math
-import datetime
+from datetime import datetime as dt
 import threading
+from threading import Thread
 import queue
 
 # scrapping requests
@@ -63,12 +64,47 @@ class ThreadSafeCounter:
             return self._counter
 
 
+class ThreadSafeFlag:
+    # constructor
+    def __init__(self):
+        # initialize counter
+        self._flag = False
+        # initialize lock
+        self._lock = threading.Lock()
+
+    def value(self):
+        with self._lock:
+            return self._flag
+
+    def set(self, value: bool):
+        with self._lock:
+            self._flag = value
+
+
+class thread_print():
+    def __init__(self):
+        # initialize lock
+        self._lock = threading.Lock()
+
+    def print(self, msg, no_format=False):
+        with self._lock:
+            if not no_format:
+                print('[{time_formatted}] {message}'.format(time_formatted=self.time_str(), message=msg))
+            else:
+                print('{message}'.format(message=msg))
+
+    @staticmethod
+    def time_str():
+        return dt.now().strftime("%H:%M:%S.%f")[:-3]
+
+
 class bcolors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
     OKCYAN = '\033[96m'
     OKGREEN = '\033[92m'
     WARNING = '\033[93m'
+    SYSTEM = '\033[35m'
     FAIL = '\033[91m'
     ENDC = '\033[0m'
     BOLD = '\033[1m'
@@ -95,7 +131,7 @@ def millify(n):
 
 
 class Database:
-    def __init__(self):
+    def __init__(self, collector_pool_size: int = 1):
         self.database = "invest_simple"
         self.host = "139.130.195.51"  # "192.168.15.200"
         self.user = "pi"  # "interface_account"
@@ -123,6 +159,19 @@ class Database:
         self.ultimate_failed_update_period = 186  # re-poll period (days) if failed too many times
         self.retry_attempts = 12  # number of re-poll attempts before listing as low priority
 
+        # storage for threads start time
+        self.time_start = None
+
+        # collector pool size
+        self.collector_pool_size = collector_pool_size
+        self.print_handle = thread_print()
+
+        # setup dict of queues and arrays
+        self.queues = {}
+        self.counters = {}
+        self.threads = {}
+        self.flags = {}
+
     def database_connect(self):
         # attempt to connect to database
         try:
@@ -146,92 +195,174 @@ class Database:
         return connection, cursor
 
     def setup(self):
-        pass
+        # setup queues
+        self.queues['ticker_list'] = queue.Queue()
+        self.queues['ticker_data'] = queue.Queue()
+        self.queues['message_logs'] = queue.Queue()
 
-    def start(self):
-        pass
+        # setup counters
+        self.counters['tasks_sent'] = ThreadSafeCounter()
+        self.counters['tasks_awaiting'] = ThreadSafeCounter()
+
+        # setup flags
+        self.flags['finder_exit_flag'] = ThreadSafeFlag()
+        self.flags['collector_exit_flag'] = ThreadSafeFlag()
+        self.flags['processor_exit_flag'] = ThreadSafeFlag()
+        self.flags['logger_exit_flag'] = ThreadSafeFlag()
+        self.flags['e_stop_flag'] = ThreadSafeFlag()
+
+        # setup threads
+        # -- FINDER
+        self.threads['Finder'] = Thread(target=self.find_stocks,
+                                        args=(self.flags['finder_exit_flag'], self.queues['ticker_list'],
+                                              self.queues['message_logs'], self.counters['tasks_awaiting']))
+
+        # -- COLLECTOR
+        for index in range(1, self.collector_pool_size + 1):
+            self.threads['Collector_{}'.format(index)] = Thread(target=self.collector, args=(
+                self.flags['collector_exit_flag'], self.queues['ticker_list'], self.queues['ticker_data'],
+                (self.counters['tasks_sent'], self.counters['tasks_awaiting']), self.queues['message_logs']))
+
+        # -- PROCESSOR
+        self.threads['Processor'] = Thread(target=self.process_data,
+                                           args=(self.flags['processor_exit_flag'], self.queues['ticker_data'],
+                                                      self.queues['message_logs']))
+        # -- LOGGER
+        self.threads['Logger'] = Thread(target=self.logger,
+                                        args=(self.flags['logger_exit_flag'], self.queues['message_logs'],))
+
+    def start(self, timeout: int = -1, silent=False):
+        self.setup()
+
+        # for simplicity
+        msg_queue = self.queues['message_logs']
+
+        # set start time and then start all threads
+        self.time_start = time.time()
+
+        # start threads
+        for thread_name in self.threads.keys():
+            if thread_name[:9] == 'Collector':
+                fname = 'Collector'
+            else:
+                fname = thread_name
+            self.msg(msg_queue, 'Starting{}Thread'.format(fname), "\tstarting {} thread: ".format(thread_name), style='system')
+            self.threads[thread_name].start()
+
+        # wait for all threads to finish
+        for thread_name in self.threads:
+            while self.threads[thread_name].is_alive():
+                # try for 10 seconds to join thread
+                for _ in range(15):
+                    self.threads[thread_name].join(2)
+
+                if timeout > 0:
+                    if time.time() - self.time_start > timeout or self.flags['e_stop_flag'].value():
+                        self.stop()
+                    elif not silent:
+                        self.print_time_remaining(timeout, msg_queue)
 
     def stop(self):
-        pass
+        # for simplicity
+        msg_queue = self.queues['message_logs']
 
-    def find_stocks(self, finder_queue, ticker_queue, message_queue, prefetched_tasks):
-        print('[{}] finder func started'.format(datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]))
+        self.msg(msg_queue, 'ShutdownCommand', 'Received shutdown command. Safely closing threads', style='fail', nowait=True)
+
+        # shutdown stock finder queue
+        self.msg(msg_queue, 'FinderThreadShutdown', '(awaiting) {} process to close gracefully'.format('finder'), style='system')
+        self.flags['finder_exit_flag'].set(True)
+        self.threads['Finder'].join()
+
+        # clear unstarted tasks
+        self.msg(msg_queue, 'ClearingQueues', 'clearing queues', style='system')
+        for queue_name in self.queues.keys():
+            if queue_name == 'message_logs':
+                continue
+
+            self.msg(msg_queue, 'ClearingQueues', '\t  clearing {} queue'.format(queue_name), style='system')
+
+            # while queue not empty, get next item until all items cleared
+            while not self.queues[queue_name].empty():
+                try:
+                    self.queues[queue_name].get(block=False)
+                    self.queues[queue_name].task_done()
+                except queue.Empty:
+                    continue
+
+        # set msg send
+        self.msg(msg_queue, 'ClearingQueues', Queue.MsgDone)
+
+        # wait for collector processors to end
+        self.flags['collector_exit_flag'].set(True)
+        for thread_name in [key for key in self.threads.keys() if key[:9] == 'Collector']:
+            # self.flags['processor_exit_flag'] = True
+            #         self.flags['logger_exit_flag'] = True
+            self.msg(msg_queue, 'CollectorThreadShutdown', '(awaiting) {} process to close gracefully'.format(thread_name), style='system')
+            self.threads[thread_name].join()
+
+        # wait for processor functions to end
+        self.flags['processor_exit_flag'].set(True)
+        self.msg(msg_queue, 'ProcessorThreadShutdown', '(awaiting) {} process to close gracefully'.format('processor'), style='system')
+        self.threads['Processor'].join()
+
+        self.flags['logger_exit_flag'].set(True)
+        self.msg(msg_queue, 'LoggerThreadShutdown', '(awaiting) {} process to close gracefully'.format('logger'), style='system')
+        self.threads['Logger'].join()
+
+    def find_stocks(self, thread_exit_flag: bool, ticker_queue, msg_queue, prefetched_tasks):
+        self.msg(msg_queue, 'StartingFinderThread', '\t\tdone.. finder thread started', style='system', nowait=True)
 
         connection, cursor = self.database_connect()
+        last_update = time.time()
         update_asx = time.time() + self._refresh_asx
         update_nas = time.time() + self._refresh_nas
         update_hke = time.time() + self._refresh_hke
-        update_refresh = time.time()
-        ticker_list = []
+        update_refresh = -1
 
         while True:
-            if not finder_queue.empty():
-                stop = finder_queue.get()
-                finder_queue.task_done()
-                if stop == Queue.Done:
-                    return
+            if thread_exit_flag.value():
+                self.msg(msg_queue, 'FinderThreadShutdown', '\t\tDone.. finder thread stopped', 'system', nowait=True)
+                return
 
             # add new asx stocks
             if time.time() >= update_asx:
                 self.update_asx_list(cursor=cursor, connection=connection)
                 update_asx = time.time() + self._refresh_asx
-                message_queue.put(('FinderProcess', datetime.datetime.now(),
-                                   'FinderProcess: refreshed new asx items'))
+                self.msg(msg_queue, 'FinderProcess', 'FinderProcess: refreshed new asx items', nowait=True)
+
             if time.time() >= update_nas:
-                self.update_nasdaq_list(cursor=cursor, connection=connection, message_queue=message_queue)
+                self.update_nasdaq_list(cursor=cursor, connection=connection, msg_queue=msg_queue)
                 update_nas = time.time() + self._refresh_nas
-                message_queue.put(('FinderProcess', datetime.datetime.now(),
-                                   'FinderProcess: refreshed new nas items'))
+                self.msg(msg_queue, 'FinderProcess', 'FinderProcess: refreshed new nas items', nowait=True)
             if time.time() >= update_hke:
-                self.update_hkse_list(cursor=cursor, connection=connection, message_queue=message_queue)
+                self.update_hkse_list(cursor=cursor, connection=connection, msg_queue=msg_queue)
                 update_hke = time.time() + self._refresh_hke
-                message_queue.put(('FinderProcess', datetime.datetime.now(),
-                                   'FinderProcess: refreshed new hke items'))
+                self.msg(msg_queue, 'FinderProcess', 'FinderProcess: refreshed new hke items', nowait=True)
 
-            # fetch new stocks
-            ticker_list = self.query("SELECT id FROM unanalysed_tickers ORDER BY marketcap DESC", cursor=cursor)
-            ticker_list = ticker_list + self.update_stock_refresh_list(cursor=cursor)
-            ticker_list = list(reversed(ticker_list))
-            #ticker_list.append(('NXT.ax',))
-            #ticker_list = [('BHP.ax',), ('CBA.ax',), ('CSL.ax',), ('TLS.ax',), ('NAB.ax',), ('WBC.ax',), ('ANZ.ax',), ('MQG.ax',), ('FMG.ax',), ('WES.ax',), ('RIO.ax',), ('NXT.ax',), ('QAN.ax',), ('PME.ax',), ('DMP.ax',), ('GOOG',), ('AAPL',), ('MSFT',), ('NVDA',), ('META',), ('NFLX',), ('DIS',), ('INTC',), ('MA',), ('V',), ('TSM',), ('TSLA',), ('AMZN',), ('BABA',), ('0700.HK',), ('TDG',)]
+            if time.time() >= update_refresh:
+                ticker_list = [('PME.ax',)]
+                ticker_list = ticker_list + self.query("SELECT id FROM unanalysed_tickers ORDER BY marketcap DESC", cursor=cursor)
+                ticker_list = ticker_list + self.update_stock_refresh_list(cursor=cursor)
+                # ticker_list = list(reversed(ticker_list))
+                update_refresh = time.time() + (5 * 60)
+                prefetched_tasks.set(len(ticker_list))
+                self.msg(msg_queue, 'FinderProcess', 'FinderProcess: refreshed new tickers list', nowait=True)
 
-            message_queue.put(('FinderProcess', datetime.datetime.now(),
-                               'FinderProcess: refreshed new tickers list'))
-            prefetched_tasks.set(len(ticker_list))
+            if time.time() >= last_update + self._max_query_per_sec:
+                if len(ticker_list) > 0 and ticker_queue.qsize() <= self._max_idle_ticker_queue_size:
+                    ticker_queue.put(ticker_list[0][0])
+                    #self.msg(msg_queue, 'FinderProcess', 'Added {} to the listings'.format(ticker_list[0][0]))
+                    ticker_list.pop(0)
+                    prefetched_tasks.set(len(ticker_list))  # update prefetched item count
+                    last_update = time.time()
 
-            item_count = 0
-            for index, item in list(reversed(list(enumerate(ticker_list)))):
-                while ticker_queue.qsize() > self._max_idle_ticker_queue_size:
-                    print(' ... pausing finder thread - Fetcher queue size too full (>{})'.format(
-                        self._max_idle_ticker_queue_size))
-                    time.sleep(2)
+            time.sleep(0.001)
 
-                ticker_queue.put(item[0])
-                ticker_list.pop(index)
-                prefetched_tasks.set(len(ticker_list))  # update prefetched item count
-                item_count = item_count + 1
-
-                if not finder_queue.empty():
-                    stop = finder_queue.get()
-                    finder_queue.task_done()
-                    if stop == Queue.Done:
-                        return
-
-                time.sleep(self._max_query_per_sec)
-
-            message_queue.put(('FinderProcess', datetime.datetime.now(),
-                               'FinderProcess: Added {} new items to ticker queue'.format(item_count)))
-            message_queue.put(('FinderProcess', datetime.datetime.now(), Queue.MsgDone))
-
-            # dont run this thread too often
-            time.sleep(60)
-
-    def fetch_stock(self, ticker_queue, data_out_queue, task_counters, message_queue):
-        print('[{}] fetcher func started'.format(datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]))
+    def collector(self, thread_exit_flag: bool, ticker_queue, data_out_queue, task_counters, msg_queue):
+        self.msg(msg_queue, 'StartingCollectorThread', '\t\tdone.. collector thread started', style='system', nowait=True)
 
         queued_tasks, prefetched_tasks = task_counters
 
-        time.sleep(3)
         # create string to describe next ticker loop
         ticker_opening_string = 'beginning new update: ' \
                                 'ticker={s_format}{s_ticker}{s_end_format} ' \
@@ -244,68 +375,79 @@ class Database:
 
         item = 1
         while True:
-            msg_list = []
-            ticker = ticker_queue.get()
-
-            # exit if end of queue
-            if ticker == Queue.Done:
-                print('[{}] fetcher func finished'.format(datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]))
-                data_out_queue.put(Queue.Done)
-                ticker_queue.put(Queue.Done)
-                ticker_queue.task_done()
+            if thread_exit_flag.value():
+                self.msg(msg_queue, 'CollectorThreadShutdown', '\t\tDone.. collector thread stopped', style='system', nowait=True)
                 return
 
-            start_time = datetime.datetime.now()
+            # get next item
+            try:
+                ticker = ticker_queue.get(timeout=0.5)
+                self.msg(msg_queue, 'CollectorGet', 'collecting next ticker "{}"'.format(ticker), nowait=True)
+            except queue.Empty:
+                continue
+
+            msg_list = [(ticker, '\tAttempting collect info')]
+
+            # setup required variables
+            stock = None
+            info = None
+            cashflow = None
 
             try:
-                msg_list.append((ticker, datetime.datetime.now(), '\tAttempting collect info'))
                 stock = self.get_yahoo_finance_data(ticker)
                 info = stock.get_info()  # dict
                 cashflow = stock.cash_flow  # _pd.DataFrame
 
-                msg_list.append((ticker, datetime.datetime.now(), '\t\tCollect Info Successful'))
+                msg_list.append((ticker, '\t\tCollect Info Successful'))
 
                 # package up data to send to evaluator
                 data_package = (ticker, info, stock, cashflow)
 
                 # output data
                 data_out_queue.put(data_package)
-
             except TypeError as e:
-                self.err_print(function=None, msg='Failed to get cashflow', error=e)
+                self.err_print(function='collector', msg='Failed to get cashflow', error=e)
                 msg_list.append(
-                    (ticker, datetime.datetime.now(), '\t\tCollect Info {}Failed{}'.format(bcolors.FAIL, bcolors.ENDC)))
-                msg_list.append((ticker, datetime.datetime.now(), Queue.MsgDone))
-                if str(e) == "string indices must be integers, not 'str'":
-                    print(':required: update stock failed')
+                    (ticker, '\t\tCollect Info {}Failed{}'.format(bcolors.FAIL, bcolors.ENDC)))
+                msg_list.append((ticker, Queue.MsgDone))
+            except Exception as e:
+                if e.__str__() == 'yfinance failed to decrypt Yahoo data response':
+                    #self.msg(msg_queue, 'Error', 'unable to get cashflow', nowait=True)
+                    self.err_print(function='collector', msg='YFinance Failure: yfinance failed to decrypt Yahoo data response', error=e)
+
+                    data_out_queue.put((ticker, info, stock, cashflow))
                 else:
-                    print('[unknown error], exiting gracefully')
+                    print(e)
+                    self.msg(msg_queue, 'UnexpectedError', 'unexpected error received, exiting softly', nowait=True)
+                    self.flags['e_stop_flag'].set(True)
+                    return
 
             item_count = queued_tasks.read_increment()
             prefetched_items = prefetched_tasks.read()
-            message_queue.put((ticker, datetime.datetime.now(),
-                               ticker_opening_string.format(ticker, item_count, item_count + ticker_queue.qsize() + prefetched_items)))
+            self.msg(msg_queue, ticker, ticker_opening_string.format(ticker, item_count, item_count + ticker_queue.qsize() + prefetched_items))
+
             for message in msg_list:
-                message_queue.put(message)
+                self.msg(msg_queue, *message)
 
             # list current ticker queue item as done
             ticker_queue.task_done()
             item = item + 1
 
-    def process_data(self, data_queue, message_queue):
-        print('[{}] processor func started'.format(datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]))
+    def process_data(self, thread_exit_flag: bool, data_queue, msg_queue):
+        self.msg(msg_queue, 'StartingProcessorThread', '\t\tdone.. processor thread started', style='system', nowait=True)
 
         connection, cursor = self.database_connect()
 
         while True:
             # get next data entry
-            data = data_queue.get()
-
-            if data == Queue.Done:
-                print('[{}] processor func finished'.format(datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]))
-                message_queue.put(Queue.Done)
-                data_queue.task_done()
+            if thread_exit_flag.value():
+                self.msg(msg_queue, 'ProcessorThreadShutdown', '\t\tDone.. processor thread stopped', style='system', nowait=True)
                 return
+
+            try:
+                data = data_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
 
             ticker_failed = False
 
@@ -314,35 +456,35 @@ class Database:
 
             try:
                 # filter and consolidate cashflow info into clean useable data
-                cashflow_statement = self.process_cashflow_data(ticker, cashflow, message_queue=message_queue)
+                cashflow_statement = self.process_cashflow_data(ticker, cashflow, msg_queue=msg_queue)
 
                 # write each annual cashflow statement to database [optimisation available to write all at once]
                 for date in cashflow_statement:
                     annual_cf = cashflow_statement[date]
-                    self.write_cashflow(ticker, date.year, *annual_cf, message_queue, cursor=cursor,
+                    self.write_cashflow(ticker, date.year, *annual_cf, msg_queue, cursor=cursor,
                                         connection=connection)
 
                 # next, evaluate results and determine new intrinsic value
-                self.evaluate_intrinsic_value(ticker, message_queue, connection=connection, cursor=cursor)
+                self.evaluate_intrinsic_value(ticker, msg_queue, connection=connection, cursor=cursor)
 
             except FailedTickerAnalysis as e:
-                message_queue.put(
-                    (ticker, datetime.datetime.now(), '\t[Warning] Received FailedTickerAnalysis exception'))
+                self.msg(msg_queue, ticker, '\t[Warning] Received FailedTickerAnalysis exception')
                 ticker_failed = e.stock_anaylsis_failure
             finally:
                 # stock now successfully updated
                 self.update_stock_status(ticker=ticker, stock_info=info, stock=stock, failed=ticker_failed,
-                                         message_queue=message_queue, connection=connection, cursor=cursor)
+                                         msg_queue=msg_queue, connection=connection, cursor=cursor)
 
                 # finally pass ticker back to finder function to mark off as complete
-                self.remove_unanalysed_stock(ticker, message_queue, cursor=cursor)
+                self.remove_unanalysed_stock(ticker, msg_queue, cursor=cursor)
 
-                message_queue.put((ticker, datetime.datetime.now(), Queue.MsgDone))
+                self.msg(msg_queue, ticker, Queue.MsgDone)
                 # mark current data queue item as done
                 data_queue.task_done()
 
-    def logger(self, message_queue):
-        print('[{}] logger func started'.format(datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]))
+    def logger(self, thread_exit_flag: bool, message_queue):
+        self.msg(message_queue, 'StartingLoggerThread', '\t\tdone.. logger thread started', nowait=True, style='system')
+
         message_packages = {}
 
         # fetching ticker
@@ -365,21 +507,23 @@ class Database:
         # track current queue sizes for ticker and evaluator queues
 
         while True:
-            message_item = message_queue.get()
-
             # exit if end of queue
-            if message_item == Queue.Done:
-                print('[{}] logger func finished'.format(datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]))
-                message_queue.task_done()
+            if thread_exit_flag.value():
+                self.print('logger thread stopped', style='system')
                 return
 
+            try:
+                message_item = message_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
             # unpack message information
-            ticker, msg_time, message = message_item
+            ticker, msg_time, message, style = message_item
             # if message is complete, print ticker message trail
             if message == Queue.MsgDone:
-                print('')
+                self.print('', no_format=True)
                 for line in message_packages[ticker]:
-                    print('[{}] {}'.format(line[0].strftime("%H:%M:%S.%f")[:-4], line[1]))
+                    self.print('{}'.format(line[1]))
 
                 # remove the no longer required message trail
                 message_packages.pop(ticker)
@@ -434,7 +578,7 @@ class Database:
 
         return yfin_result
 
-    def write_cashflow(self, ticker, year, operating_cashflow, cap_expenditure, free_cashflow, message_queue, cursor,
+    def write_cashflow(self, ticker, year, operating_cashflow, cap_expenditure, free_cashflow, msg_queue, cursor,
                        connection):
         # encapsulate inputs in ___
         cashflow_data = (ticker, year, operating_cashflow, cap_expenditure, free_cashflow)
@@ -454,8 +598,7 @@ class Database:
             connection.commit()
         except psycopg2.errors.UniqueViolation as e:
             msg = 'Key (id, year)=({0}, {1}) already exists.'.format(ticker, year)
-            self.err_print(function='write_cashflow', msg=msg, error=e, ticker=ticker, message_queue=message_queue,
-                           msg_only=True)
+            self.err_print(function='write_cashflow', msg=msg, error=e, ticker=ticker, msg_queue=msg_queue, msg_only=True)
             connection.reset()
         except (Exception, psycopg2.DatabaseError) as e:
             print('\tERR: cashflow write error for {0}'.format(ticker))
@@ -509,11 +652,11 @@ class Database:
             exit()
             connection.reset()
 
-    def update_nasdaq_list(self, cursor, connection, message_queue):
+    def update_nasdaq_list(self, cursor, connection, msg_queue):
         # sql to write data [optimisable if pre-check done in sql]
         sql = """INSERT INTO unanalysed_tickers(id, marketcap) VALUES %s RETURNING id;"""
 
-        message_queue.put(('scanning nasdaq', datetime.datetime.now(), 'scanning nasdaq for new stocks'))
+        self.msg(msg_queue, 'scanning nasdaq', 'scanning nasdaq for new stocks')
 
         # download files
         if os.path.exists("nasdaq.lst"):
@@ -521,7 +664,7 @@ class Database:
         if os.path.exists("otherlisted.lst"):
             os.remove("otherlisted.lst")
 
-        message_queue.put(('scanning nasdaq', datetime.datetime.now(), '\tdownloading all nasdaq stocks'))
+        self.msg(msg_queue, 'scanning nasdaq', '\tdownloading all nasdaq stocks')
         os.system("curl --ftp-ssl anonymous:jupi@jupi.com "
                   "ftp://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqlisted.txt "
                   "> nasdaq.lst")
@@ -530,7 +673,7 @@ class Database:
                   "ftp://ftp.nasdaqtrader.com/SymbolDirectory/otherlisted.txt "
                   "> otherlisted.lst")
 
-        message_queue.put(('scanning nasdaq', datetime.datetime.now(), '\tloading data and columns'))
+        self.msg(msg_queue, 'scanning nasdaq', '\tloading data and columns')
         # load data
         try:
             # nasdaq
@@ -542,11 +685,12 @@ class Database:
         except (Exception,) as e:
             self.err_print(function=None, msg='failed to download / read nasdaq files. returning',
                            error=e)
-            message_queue.put(('scanning nasdaq', datetime.datetime.now(), Queue.MsgDone))
+
+            self.msg(msg_queue, 'scanning nasdaq', Queue.MsgDone)
             exit()
             return
 
-        message_queue.put(('scanning nasdaq', datetime.datetime.now(), '\tcleaning data'))
+        self.msg(msg_queue, 'scanning nasdaq', '\tcleaning data')
         # trim header and footer rows
         nasdaq.drop(index=nasdaq.index[0], axis=0, inplace=True)
         nasdaq.drop(index=nasdaq.index[-1], axis=0, inplace=True)
@@ -573,7 +717,7 @@ class Database:
         # reset index
         otherlisted.reset_index(inplace=True)
 
-        message_queue.put(('scanning nasdaq', datetime.datetime.now(), '\tchecking if stocks already analysed'))
+        self.msg(msg_queue, 'scanning nasdaq', '\tchecking if stocks already analysed')
         # read data into sql list
         data = []
 
@@ -592,12 +736,11 @@ class Database:
                 data.append((ticker, -1))
 
         if len(data) == 0:
-            message_queue.put(
-                ('scanning nasdaq', datetime.datetime.now(), '\tno new stocks found, exiting with no actions'))
-            message_queue.put(('scanning nasdaq', datetime.datetime.now(), Queue.MsgDone))
+            self.msg(msg_queue, 'scanning nasdaq', '\tno new stocks found, exiting with no actions')
+            self.msg(msg_queue, 'scanning nasdaq', Queue.MsgDone)
             return
 
-        message_queue.put(('scanning nasdaq', datetime.datetime.now(), '\twriting new NASDAQ stocks to sql database'))
+        self.msg(msg_queue, 'scanning nasdaq', '\twriting new NASDAQ stocks to sql database')
         try:
             # run query
             psycopg2.extras.execute_values(cursor, sql, data, template=None, page_size=10000)
@@ -607,26 +750,25 @@ class Database:
 
             # commit changes
             connection.commit()
-            message_queue.put(
-                ('scanning nasdaq', datetime.datetime.now(), 'added {0} new nasdaq tickers'.format(len(rs))))
-            message_queue.put(('scanning nasdaq', datetime.datetime.now(), Queue.MsgDone))
+            self.msg(msg_queue, 'scanning nasdaq', 'added {0} new nasdaq tickers'.format(len(rs)))
+            self.msg(msg_queue, 'scanning nasdaq', Queue.MsgDone)
         except psycopg2.errors.UniqueViolation as e:
             connection.reset()
         except (Exception, psycopg2.DatabaseError) as e:
             self.err_print(function=None, msg='Failed to write to database', error=e)
 
-            message_queue.put(('scanning nasdaq', datetime.datetime.now(), Queue.MsgDone))
+            self.msg(msg_queue, 'scanning nasdaq', Queue.MsgDone)
             exit()
             connection.reset()
 
-    def update_hkse_list(self, cursor, connection, message_queue):
+    def update_hkse_list(self, cursor, connection, msg_queue):
         sql = """INSERT INTO unanalysed_tickers(id, marketcap) VALUES %s RETURNING id;"""
 
         # build list from wiki
         # 'https://en.wikipedia.org/wiki/List_of_companies_listed_on_the_Hong_Kong_Stock_Exchange'
 
-        message_queue.put(('scanning hkse', datetime.datetime.now(), 'scanning hkse for new stocks'))
-        message_queue.put(('scanning hkse', datetime.datetime.now(), '\tdownloading html'))
+        self.msg(msg_queue, 'scanning hkse', 'scanning hkse for new stocks')
+        self.msg(msg_queue, 'scanning hkse', '\tdownloading html')
         # get the page Details
         page = wikipedia.page("List of companies listed on the Hong Kong Stock Exchange")
         content = page.html()
@@ -635,7 +777,7 @@ class Database:
         # for a in soup.findAll('a', href=True, attrs={'class': '_31qSD5'}):
         #    name = a.find('div', attrs={'class': '_3wU53n'})
 
-        message_queue.put(('scanning hkse', datetime.datetime.now(), '\tscanning html for table items'))
+        self.msg(msg_queue, 'scanning hkse', '\tscanning html for table items')
         data = []
         for table in soup.findAll('table'):
             for a in table.findAll('a', href=True, attrs={'class': 'external text'}):
@@ -649,13 +791,10 @@ class Database:
                         data.append((ticker, -1))
 
         if len(data) == 0:
-            message_queue.put(
-                ('scanning hkse', datetime.datetime.now(), '\tno new stocks found, exiting with no actions'))
-            print('no new hkse listings')
+            self.msg(msg_queue, 'scanning hkse', '\tno new stocks found, exiting with no actions')
             return
 
-        print('\tUpdating unanalysed stock list: adding {} new tickers'.format(len(data)))
-        message_queue.put(('scanning hkse', datetime.datetime.now(), '\tfound {} new listings'.format(len(data))))
+        self.msg(msg_queue, 'scanning hkse', '\tfound {} new listings'.format(len(data)))
 
         try:
             # run query
@@ -668,12 +807,12 @@ class Database:
 
             # commit changes
             connection.commit()
-            message_queue.put(('scanning hkse', datetime.datetime.now(), '\tnew listings successfully added'))
-            message_queue.put(('scanning hkse', datetime.datetime.now(), Queue.MsgDone))
+            self.msg(msg_queue, 'scanning hkse', '\tnew listings successfully added')
+            self.msg(msg_queue, 'scanning hkse', Queue.MsgDone)
         except (Exception, psycopg2.DatabaseError) as e:
             self.err_print(function=None, msg='Failed to write to database', error=e)
-            message_queue.put(('scanning hkse', datetime.datetime.now(), '\terror adding listings to sql database'))
-            message_queue.put(('scanning hkse', datetime.datetime.now(), Queue.MsgDone))
+            self.msg(msg_queue, 'scanning hkse', '\terror adding listings to sql database')
+            self.msg(msg_queue, 'scanning hkse', Queue.MsgDone)
             connection.reset()
 
     def update_stock_refresh_list(self, cursor):
@@ -703,18 +842,18 @@ class Database:
 
         return self.query(sql, cursor=cursor)
 
-    def remove_unanalysed_stock(self, ticker, message_queue, cursor):
+    def remove_unanalysed_stock(self, ticker, msg_queue, cursor):
         sql = "DELETE FROM unanalysed_tickers WHERE id='{0}' RETURNING id;"
 
-        message_queue.put((ticker, datetime.datetime.now(), '\tremoving {0} from unanalysed stocks'.format(ticker)))
+        self.msg(msg_queue, ticker, '\tremoving {0} from unanalysed stocks'.format(ticker))
 
         result = self.query(sql.format(ticker), cursor=cursor)
         if len(result) > 0:
-            message_queue.put((ticker, datetime.datetime.now(), '\t\tsuccessfully removed item from sql table'))
+            self.msg(msg_queue, ticker, '\t\tsuccessfully removed item from sql table')
         else:
-            message_queue.put((ticker, datetime.datetime.now(), '\t\tfailed to remove item from sql table'))
+            self.msg(msg_queue, ticker, '\t\tfailed to remove item from sql table')
 
-    def get_cashflow(self, ticker, cursor, message_queue):
+    def get_cashflow(self, ticker, cursor, msg_queue):
         sql = "SELECT year, operating_cashflow, cap_expenditure, freecashflow FROM cashflow WHERE id='{0}' ORDER BY year;"
         cashflow = self.query(sql.format(ticker), cursor=cursor)
 
@@ -724,10 +863,7 @@ class Database:
 
         # safeguard against stocks with only 1 year of data
         if len(formatted_cashflow) < 2:
-            message_queue.put((
-                ticker, datetime.datetime.now(),
-                '\tInsufficient data to calculate intrinsic value - found {} years of data'.format(
-                    len(formatted_cashflow))))
+            self.msg(msg_queue, ticker, '\tInsufficient data to calculate intrinsic value - found {} years of data'.format(len(formatted_cashflow)))
             raise FailedTickerAnalysis(stock_anaylsis_failure=False)
 
         # if data contains negative numbers, left adjust to avoid expected results
@@ -749,20 +885,19 @@ class Database:
 
         return formatted_cashflow
 
-    def get_stock_info(self, ticker, stock_info, stock, cursor, message_queue):
+    def get_stock_info(self, ticker, stock_info, stock, cursor, msg_queue):
         if stock_info is not None:
             # get stock name
             name = stock_info.get('longName', 'NA') or 'NA'
 
             # get stock sector
             sector = stock_info.get('sector', 'NA')
-
             # get current stock market price
             try:
                 market_price = stock.history(period='1d', )['Close'].iloc[-1]
             except Exception as e:
                 msg = 'Failed to get market price data from stock.history'
-                self.err_print(function='get_stock_info', msg=msg, error=e, ticker=ticker, message_queue=message_queue,
+                self.err_print(function='get_stock_info', msg=msg, error=e, ticker=ticker, msg_queue=msg_queue,
                                msg_only=False)
                 market_price = -1
 
@@ -793,9 +928,9 @@ class Database:
 
         return name, sector, shares_outstanding, market_cap, existing_in_sql, failure_count
 
-    def evaluate_intrinsic_value(self, ticker, message_queue, connection, cursor) -> bool:
+    def evaluate_intrinsic_value(self, ticker, msg_queue, connection, cursor) -> bool:
         # get all current data
-        cashflow = self.get_cashflow(ticker, cursor, message_queue=message_queue)
+        cashflow = self.get_cashflow(ticker, cursor, msg_queue=msg_queue)
 
         # First calculate G1
         g1_growth = self.calculate_g1_growth(cashflow)
@@ -830,10 +965,10 @@ class Database:
             for year_dx in range(10):
                 # predict likely earnings
                 predicted_earnings[g] = predicted_earnings[g] * (
-                            1 + growth_rates[g][0] - ((growth_rates[g][0] - growth_10yr[g][0]) / 9) * year_dx)
-                # predicted_earnings[g] = predicted_earnings[g] * (1 + growth_rates[g][0] - (0.5 * growth_rates[g][0] / 9) * year_dx)
+                        1 + growth_rates[g][0] - ((growth_rates[g][0] - growth_10yr[g][0]) / 9) * year_dx)
+
                 predicted_capex[g] = predicted_capex[g] * (
-                            1 + growth_rates[g][1] - ((growth_rates[g][1] - growth_10yr[g][1]) / 9) * year_dx)
+                        1 + growth_rates[g][1] - ((growth_rates[g][1] - growth_10yr[g][1]) / 9) * year_dx)
                 # assume capex can never be negative (aka, your debt will never make you money, best debt = no debt)
                 if predicted_capex[g] < 0:
                     predicted_capex[g] = 0
@@ -869,7 +1004,8 @@ class Database:
         # log output
         intrinsic_value_desc = '\tintrinsic value estimate calculated: {col}{value}{e_col}   ({timeframe} years of data)'.format(
             value=millify(intrinsic[1] * 1000000), col=bcolors.OKGREEN, e_col=bcolors.ENDC, timeframe=len(cashflow))
-        message_queue.put((ticker, datetime.datetime.now(), intrinsic_value_desc))
+        self.msg(msg_queue, ticker, intrinsic_value_desc)
+
         # log asset growth
         if growth_rates[1][0] > 0:
             col = bcolors.OKGREEN
@@ -877,7 +1013,8 @@ class Database:
             col = bcolors.FAIL
         rev_growth_desc = '\toperating activities revenue growth: {}{:+.1f}%{}'.format(
             col, 100 * growth_rates[1][0], bcolors.ENDC)
-        message_queue.put((ticker, datetime.datetime.now(), rev_growth_desc))
+        self.msg(msg_queue, ticker, rev_growth_desc)
+
         # log cost of asset growth
         if growth_rates[1][0] > growth_rates[1][1]:
             col = bcolors.OKGREEN
@@ -885,7 +1022,7 @@ class Database:
             col = bcolors.FAIL
         costofrev_growth_desc = '\tcost of operating activities growth: {}{:+.1f}%{}'.format(
             col, 100 * growth_rates[1][1], bcolors.ENDC)
-        message_queue.put((ticker, datetime.datetime.now(), costofrev_growth_desc))
+        self.msg(msg_queue, ticker, costofrev_growth_desc)
 
         # prep sql statements
         # check if intrinsic value table has ticker
@@ -913,16 +1050,16 @@ class Database:
         results_2 = self.query_write(sql_2, connection, cursor, values_2)
 
         if len(results_2) > 0:
-            message_queue.put((ticker, datetime.datetime.now(), '\tsuccessfully updated intrinsic value evaluation'))
+            self.msg(msg_queue, ticker, '\tsuccessfully updated intrinsic value evaluation')
         else:
-            message_queue.put((ticker, datetime.datetime.now(), '\t{}failed{} to update intrinsic value evaluation'.format(bcolors.FAIL, bcolors.ENDC)))
+            self.msg(msg_queue, ticker, '\t{}failed{} to update intrinsic value evaluation'.format(bcolors.FAIL, bcolors.ENDC))
 
-    def update_stock_status(self, ticker, stock_info, stock, failed, message_queue, connection, cursor, comment=''):
+    def update_stock_status(self, ticker, stock_info, stock, failed, msg_queue, connection, cursor, comment=''):
         name, sector, shares_outstanding, market_cap, existing_in_sql, failure_count = self.get_stock_info(ticker,
                                                                                                            stock_info,
                                                                                                            stock,
                                                                                                            cursor=cursor,
-                                                                                                           message_queue=message_queue)
+                                                                                                           msg_queue=msg_queue)
 
         # determine value for update_attempts
         if not failed:
@@ -937,7 +1074,7 @@ class Database:
             failure_count = 1
             update_status_str = bcolors.FAIL + '\tupdating attempt failure ({0} -> {1})'.format(0, 1) + bcolors.ENDC
 
-        message_queue.put((ticker, datetime.datetime.now(), update_status_str))
+        self.msg(msg_queue, ticker, update_status_str)
 
         # if ticker doesn't exist in table, add it, else update it
         if not existing_in_sql:
@@ -952,10 +1089,10 @@ class Database:
 
         self.query_write(sql, connection, cursor, values)
 
-    def process_cashflow_data(self, ticker: str, cashflow: pd.DataFrame, message_queue) -> pd.DataFrame:
-        if cashflow.empty:
+    def process_cashflow_data(self, ticker: str, cashflow: pd.DataFrame, msg_queue) -> pd.DataFrame:
+        if cashflow is None or cashflow.empty:
             msg = '\tUpdate ERR: {0} cashflow statement empty, ignore and continue'.format(ticker)
-            self.err_print(function=None, msg=msg, error=None, ticker=ticker, message_queue=message_queue,
+            self.err_print(function='process_cashflow_data', msg=msg, error=None, ticker=ticker, msg_queue=msg_queue,
                            msg_only=True)
             raise FailedTickerAnalysis
 
@@ -1004,6 +1141,73 @@ class Database:
             raise FailedTickerAnalysis
 
         return cashflow_statements
+
+    def print_time_remaining(self, timeout, msg_queue):
+        # calculate time remaining
+        remaining_time = self.time_start + timeout - time.time()
+
+        # calculate minutes and seconds
+        minutes = math.floor(remaining_time / 60)
+        seconds = math.floor(remaining_time % 60)
+
+        # print correctly formatted time results. >60s = m:ss. <60 = ss
+        if minutes:
+            self.msg(msg_queue, 'StopTime', 'stopping in {:.0f}:{:02.0f}s'.format(minutes, seconds), style='system', nowait=True)
+        else:
+            self.msg(msg_queue, 'StopTime', 'stopping in {:.0f}s'.format(seconds), style='system', nowait=True)
+
+    def print(self, msg, style='default', no_format=False):
+        style_dict = {'system': bcolors.SYSTEM}
+
+        if style in style_dict.keys():
+            msg = '{}{}{}'.format(style_dict[style], msg, bcolors.ENDC)
+        self.print_handle.print(msg, no_format)
+
+        return True
+
+    def err_print(self, function='No Func Provided', msg='', error=None, ticker=None, msg_queue=None, msg_only=False):
+
+        string_err = '\t{s_format}[ERR {s_func}] {s_msg}{e_format}'
+
+        if not msg_only:
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+
+            function = exc_tb.tb_frame.f_code.co_name
+            line_num = exc_tb.tb_lineno
+
+            error_desc = '{type} line {line}: '.format(type=re.split("'", str(exc_type))[1], line=line_num)
+
+            error_desc_components = re.split('\n', error.__str__().strip())
+            if len(error_desc_components) > 1:
+                error_desc = error_desc + error_desc_components[0]
+            for line in error_desc_components[1:]:
+                error_desc = error_desc + '\n' + '\t' * 6 + line.strip('\n')
+
+            if not msg_only:
+                string_err = string_err + '\n' + '\t' * 6 + '{s_err}'.format(s_err=error_desc)
+
+        string_err = string_err.format(s_func=function, s_msg=msg, s_format=bcolors.WARNING, e_format=bcolors.ENDC)
+
+        if msg_queue is None:
+            print(string_err)
+        else:
+            self.msg(msg_queue, ticker, string_err, style='fail')
+        # print(exc_type, fname, exc_tb.tb_lineno)
+
+    @staticmethod
+    def msg(msg_queue, topic, msg, style='default', nowait=False):
+        style_dict = {'system': bcolors.SYSTEM, 'warning': bcolors.WARNING, 'fail': bcolors.FAIL}
+
+        if style in style_dict.keys():
+            msg = '{}{}{}'.format(style_dict[style], msg, bcolors.ENDC)
+
+        payload = (topic, dt.now(), msg, style)
+        msg_queue.put(payload)
+
+        if nowait:
+            payload = (topic, dt.now(), Queue.MsgDone, style)
+            msg_queue.put(payload)
 
     @staticmethod
     def calculate_g1_growth(cashflow):
@@ -1054,44 +1258,19 @@ class Database:
 
         return g3_growth
 
-    @staticmethod
-    def err_print(function='No Func Provided', msg='', error=None, ticker=None, message_queue=None, msg_only=False):
-
-        string_err = '\t{s_format}[ERR {s_func}] {s_msg}{e_format}'
-
-        if not msg_only:
-            exc_type, exc_obj, exc_tb = sys.exc_info()
-            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-
-            function = exc_tb.tb_frame.f_code.co_name
-            line_num = exc_tb.tb_lineno
-
-            error_desc = '{type} line {line}: '.format(type=re.split("'", str(exc_type))[1], line=line_num)
-
-            error_desc_components = re.split('\n', error.__str__().strip())
-            if len(error_desc_components) > 1:
-                error_desc = error_desc + error_desc_components[0]
-            for line in error_desc_components[1:]:
-                error_desc = error_desc + '\n' + '\t' * 6 + line.strip('\n')
-
-            if not msg_only:
-                string_err = string_err + '\n' + '\t' * 6 + '{s_err}'.format(s_err=error_desc)
-
-        string_err = string_err.format(s_func=function, s_msg=msg, s_format=bcolors.WARNING, e_format=bcolors.ENDC)
-
-        if message_queue is None:
-            print(string_err)
-        else:
-            message_queue.put((ticker, datetime.datetime.now(), string_err))
-        # print(exc_type, fname, exc_tb.tb_lineno)
-
 
 def main():
     # create database object
     pi_sql = Database()
 
-    pi_sql.start()
-    print('pi database now running')
+    try:
+        pi_sql.start(timeout=30*60, silent=False)
+    except KeyboardInterrupt:
+        pi_sql.stop()
+    finally:
+        print('Program finished')
+
+    return
 
     """
     ticker = 'COL.ax'
@@ -1137,11 +1316,13 @@ def main():
     # find new stocks
     # ... some code
 
-    p_finder = threading.Thread(target=pi_sql.find_stocks, args=(q_finder, q_new_tickers, q_message_log, prefetched_tasks))
+    p_finder = threading.Thread(target=pi_sql.find_stocks,
+                                args=(q_finder, q_new_tickers, q_message_log, prefetched_tasks))
 
     p_collector_pool = []
     for i in range(1):
-        p = threading.Thread(target=pi_sql.fetch_stock, args=(q_new_tickers, q_raw_data, (queued_tasks, prefetched_tasks), q_message_log))
+        p = threading.Thread(target=pi_sql.collector,
+                             args=(q_new_tickers, q_raw_data, (queued_tasks, prefetched_tasks), q_message_log))
         p_collector_pool.append(p)
     p_processor = threading.Thread(target=pi_sql.process_data, args=(q_raw_data, q_message_log))
     p_logger = threading.Thread(target=pi_sql.logger, args=(q_message_log,))
@@ -1163,8 +1344,9 @@ def main():
             while process.is_alive():
                 process.join(15)
 
-                if end_time-time.time() > 60:
-                    print('stopping in {:.0f}:{:.0f}s'.format(int((end_time-time.time()) / 60), math.floor((end_time - time.time()) % 60)))
+                if end_time - time.time() > 60:
+                    print('stopping in {:.0f}:{:.0f}s'.format(int((end_time - time.time()) / 60),
+                                                              math.floor((end_time - time.time()) % 60)))
                 else:
                     print('stopping in {:.0f}s'.format((end_time - time.time())))
 
@@ -1193,7 +1375,7 @@ def main():
         p_processor.join()
         p_logger.join()
 
-    print('[{}] finishing'.format(datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]))
+    print('[{}] finishing'.format(dt.now().strftime("%H:%M:%S.%f")[:-3]))
     # item = 1
 
     """

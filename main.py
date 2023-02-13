@@ -6,19 +6,20 @@ import pandas as pd
 import numpy as np
 import re
 import math
-from datetime import datetime as dt
-import threading
-from threading import Thread
 import queue
+from threading import Thread
 
 # scrapping requests
 import wikipedia
-import yfinance
 from bs4 import BeautifulSoup
 import psycopg2
 import psycopg2.extras
 import pyasx.data.companies
-from tqdm import tqdm
+#from tqdm import tqdm
+
+# import local files
+from util import ThreadSafeFlag, ThreadSafeCounter, Queue, bcolors, thread_print
+from yahoo_interface import yfin_obj, yquery_obj
 
 HourlyLimit = 180
 
@@ -34,100 +35,6 @@ class FailedTickerAnalysis(Exception):
         self.message = message
 
         super().__init__(self.message)
-
-
-class ThreadSafeCounter:
-    # constructor
-    def __init__(self):
-        # initialize counter
-        self._counter = 0
-        # initialize lock
-        self._lock = threading.Lock()
-
-    def read(self):
-        with self._lock:
-            return self._counter
-
-    # increment the counter
-    def increment(self):
-        with self._lock:
-            self._counter += 1
-
-    def set(self, value):
-        with self._lock:
-            self._counter = value
-
-    # increment and get the counter value
-    def read_increment(self):
-        with self._lock:
-            self._counter += 1
-            return self._counter
-
-
-class ThreadSafeFlag:
-    # constructor
-    def __init__(self):
-        # initialize counter
-        self._flag = False
-        # initialize lock
-        self._lock = threading.Lock()
-
-    def value(self):
-        with self._lock:
-            return self._flag
-
-    def set(self, value: bool):
-        with self._lock:
-            self._flag = value
-
-
-class thread_print():
-    def __init__(self):
-        # initialize lock
-        self._lock = threading.Lock()
-
-    def print(self, msg, no_format=False):
-        with self._lock:
-            if not no_format:
-                print('[{time_formatted}] {message}'.format(time_formatted=self.time_str(), message=msg))
-            else:
-                print('{message}'.format(message=msg))
-
-    @staticmethod
-    def time_str():
-        return dt.now().strftime("%H:%M:%S.%f")[:-3]
-
-
-class bcolors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    SYSTEM = '\033[35m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-
-
-class Queue:
-    Done = 'QueueComplete'
-    MsgDone = 'MsgComplete'
-
-
-def millify(n):
-    millnames = ['', 'K', 'M', 'B', 'T']
-    n = float(n)
-    millidx = max(0, min(len(millnames) - 1,
-                         int(math.floor(0 if n == 0 else math.log10(abs(n)) / 3))))
-
-    if millidx <= 4:
-        suffix = millnames[millidx]
-    else:
-        suffix = ' * 10^{0}'.format(millidx * 3)
-
-    return '${:.2f}{}'.format(n / 10 ** (3 * millidx), suffix)
 
 
 class Database:
@@ -313,7 +220,7 @@ class Database:
         self.msg(msg_queue, 'StartingFinderThread', '\t\tdone.. finder thread started', style='system', nowait=True)
 
         connection, cursor = self.database_connect()
-        last_update = time.time()
+        last_update = -1
         update_asx = time.time() + self._refresh_asx
         update_nas = time.time() + self._refresh_nas
         update_hke = time.time() + self._refresh_hke
@@ -340,7 +247,7 @@ class Database:
                 self.msg(msg_queue, 'FinderProcess', 'FinderProcess: refreshed new hke items', nowait=True)
 
             if time.time() >= update_refresh:
-                ticker_list = [('PME.ax',)]
+                ticker_list = [('NXT.ax',), ('GOOG',)]
                 ticker_list = ticker_list + self.query("SELECT id FROM unanalysed_tickers ORDER BY marketcap DESC", cursor=cursor)
                 ticker_list = ticker_list + self.update_stock_refresh_list(cursor=cursor)
                 # ticker_list = list(reversed(ticker_list))
@@ -395,7 +302,7 @@ class Database:
 
             try:
                 stock = self.get_yahoo_finance_data(ticker)
-                info = stock.get_info()  # dict
+                info = stock.info  # dict
                 cashflow = stock.cash_flow  # _pd.DataFrame
 
                 msg_list.append((ticker, '\t\tCollect Info Successful'))
@@ -1085,9 +992,9 @@ class Database:
             values = (market_cap, shares_outstanding, failure_count, ticker)
         else:
             sql = """UPDATE ticker SET last_update=CURRENT_DATE, update_attempts=%s, comment=%s WHERE id=%s RETURNING id;"""
-            values = (failure_count, ticker, comment)
+            values = (failure_count, comment, ticker)
 
-        self.query_write(sql, connection, cursor, values)
+        result = self.query_write(sql, connection, cursor, values)
 
     def process_cashflow_data(self, ticker: str, cashflow: pd.DataFrame, msg_queue) -> pd.DataFrame:
         if cashflow is None or cashflow.empty:
@@ -1259,7 +1166,111 @@ class Database:
         return g3_growth
 
 
+def yfinance_func_test():
+    results = []
+
+    try:
+        msft = yfinance.Ticker("MSFT")
+        print('ticker {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
+        results.append(True)
+    except Exception as e:
+        print('{}failed{} on ticker'.format(bcolors.FAIL, bcolors.ENDC))
+        results.append(False)
+
+    try:
+        msft.info
+        print('info {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
+        results.append(True)
+    except Exception as e:
+        print('{}failed{} on info'.format(bcolors.FAIL, bcolors.ENDC))
+        results.append(False)
+
+    try:
+        msft.fast_info
+        print('fast info {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
+        results.append(True)
+    except Exception as e:
+        print('{}failed{} on fast info'.format(bcolors.FAIL, bcolors.ENDC))
+        results.append(False)
+
+    try:
+        hist = msft.cashflow
+        print('cashflow {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
+        results.append(True)
+    except Exception as e:
+        print('{}failed{} on cashflow'.format(bcolors.FAIL, bcolors.ENDC))
+        results.append(False)
+
+    try:
+        hist = msft.history(period="1mo")
+        print('history {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
+        results.append(True)
+    except Exception as e:
+        print('{}failed{} on history'.format(bcolors.FAIL, bcolors.ENDC))
+        results.append(False)
+
+    return results
+
+
+def yquery_func_test():
+    results = []
+
+    try:
+        msft = yahooquery.Ticker("PME.ax")
+        print('ticker {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
+        results.append(True)
+    except Exception as e:
+        print('{}failed{} on ticker'.format(bcolors.FAIL, bcolors.ENDC))
+        results.append(False)
+
+    print(msft.asset_profile)
+    #print(msft.summary_detail)
+    #print(msft.cash_flow())
+    exit()
+    try:
+        msft.info
+        print('info {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
+        results.append(True)
+    except Exception as e:
+        print('{}failed{} on info'.format(bcolors.FAIL, bcolors.ENDC))
+        results.append(False)
+
+    try:
+        msft.fast_info
+        print('fast info {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
+        results.append(True)
+    except Exception as e:
+        print('{}failed{} on fast info'.format(bcolors.FAIL, bcolors.ENDC))
+        results.append(False)
+
+    try:
+        hist = msft.cashflow
+        print('cashflow {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
+        results.append(True)
+    except Exception as e:
+        print('{}failed{} on cashflow'.format(bcolors.FAIL, bcolors.ENDC))
+        results.append(False)
+
+    try:
+        hist = msft.history(period="1mo")
+        print('history {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
+        results.append(True)
+    except Exception as e:
+        print('{}failed{} on history'.format(bcolors.FAIL, bcolors.ENDC))
+        results.append(False)
+
+    return results
+
+
 def main():
+
+    #test_results = yfinance_func_test()
+    #print('\nyfinance passed {}/{}'.format(test_results.count(True), len(test_results)))
+
+    #test_results = yquery_func_test()
+    #print('\nyfinance passed {}/{}'.format(test_results.count(True), len(test_results)))
+
+    return
     # create database object
     pi_sql = Database()
 
@@ -1269,130 +1280,6 @@ def main():
         pi_sql.stop()
     finally:
         print('Program finished')
-
-    return
-
-    """
-    ticker = 'COL.ax'
-    ticker = 'AUI.ax'
-    ticker = 'BBN.ax'
-
-    q_new_tickers = queue.Queue()
-    q_raw_data = queue.Queue()
-    message_log = queue.Queue()
-    q_new_tickers.put(ticker)
-    q_new_tickers.put(Queue.Done)
-
-    connection,cursor=pi_sql.database_connect()
-
-    pi_sql.write_cashflow(ticker, 2018, 10489.0, -6718.0, 10489.0-6718.0, message_log, cursor, connection)
-    pi_sql.write_cashflow(ticker, 2017, 13171.0, -7351.0, 13171.0-7351.0, message_log, cursor, connection)
-    pi_sql.write_cashflow(ticker, 2016, 7078.0, -6179.0, 7078.0-6179.0, message_log, cursor, connection)
-    pi_sql.write_cashflow(ticker, 2015, 4781.0, -6022.0, 4781.0-6022.0, message_log, cursor, connection)
-
-    pi_sql.evaluate_intrinsic_value(ticker, message_log, connection, cursor)
-
-    while not message_log.empty():
-        print(message_log.get()[2])
-    return
-    task_counter = ThreadSafeCounter()
-    
-
-    pi_sql.fetch_stock(q_new_tickers, q_raw_data, task_counter, q_message_log)
-    print(q_raw_data.qsize())
-    pi_sql.process_data(q_raw_data, q_message_log)
-    return
-    """
-
-    # setup queues
-    q_finder = queue.Queue()
-    q_new_tickers = queue.Queue()
-    q_raw_data = queue.Queue()
-    q_message_log = queue.Queue()
-
-    queued_tasks = ThreadSafeCounter()
-    prefetched_tasks = ThreadSafeCounter()
-    # x = q_message_log.get()
-    # find new stocks
-    # ... some code
-
-    p_finder = threading.Thread(target=pi_sql.find_stocks,
-                                args=(q_finder, q_new_tickers, q_message_log, prefetched_tasks))
-
-    p_collector_pool = []
-    for i in range(1):
-        p = threading.Thread(target=pi_sql.collector,
-                             args=(q_new_tickers, q_raw_data, (queued_tasks, prefetched_tasks), q_message_log))
-        p_collector_pool.append(p)
-    p_processor = threading.Thread(target=pi_sql.process_data, args=(q_raw_data, q_message_log))
-    p_logger = threading.Thread(target=pi_sql.logger, args=(q_message_log,))
-
-    # for ease of use, add all processors to an array
-    processes = [p_finder] + p_collector_pool + [p_processor, p_logger]
-
-    try:
-        p_finder.start()
-        for p in p_collector_pool:
-            p.start()
-        p_processor.start()
-        p_logger.start()
-
-        duration = 2 * 60 * 60
-        end_time = time.time() + duration
-
-        for process in processes:
-            while process.is_alive():
-                process.join(15)
-
-                if end_time - time.time() > 60:
-                    print('stopping in {:.0f}:{:.0f}s'.format(int((end_time - time.time()) / 60),
-                                                              math.floor((end_time - time.time()) % 60)))
-                else:
-                    print('stopping in {:.0f}s'.format((end_time - time.time())))
-
-                if time.time() > end_time:
-                    raise KeyboardInterrupt
-
-    except KeyboardInterrupt:
-        print('safely closing threads')
-
-        q_finder.put(Queue.Done)
-        p_finder.join()
-
-        # clear our queue and send QueueDone msg
-        for q in [q_new_tickers, q_raw_data]:
-            while not q.empty():
-                try:
-                    q.get(block=False)
-                except queue.Empty:
-                    continue
-                q.task_done()
-            q.put(Queue.Done)
-        q_message_log.put(Queue.Done)
-
-        for p in p_collector_pool:
-            p.join()
-        p_processor.join()
-        p_logger.join()
-
-    print('[{}] finishing'.format(dt.now().strftime("%H:%M:%S.%f")[:-3]))
-    # item = 1
-
-    """
-        for ticker in ticker_list:
-        print(ticker_opening_string.format(ticker[0], item))
-        
-        # get stock info
-        # stock_info = await setup_future(func=pi_sql.fetch_stock, args=(ticker,))
-
-        # process stock info
-        # if stock_info:
-        #    process_functions.append(setup_future(func=pi_sql.process_data, args=(ticker, stock_info,)))
-
-        item = item + 1
-    """
-
-    # finally, await last tasks and exit script
 
 
 if __name__ == '__main__':

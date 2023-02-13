@@ -21,6 +21,9 @@ import pyasx.data.companies
 from util import ThreadSafeFlag, ThreadSafeCounter, Queue, bcolors, thread_print
 from yahoo_interface import yfin_obj, yquery_obj
 
+import yfinance
+from yahoo_interface import yfin_obj, yquery_obj
+
 HourlyLimit = 180
 
 _discount_rate = 0.15
@@ -1270,12 +1273,11 @@ def main():
     #test_results = yquery_func_test()
     #print('\nyfinance passed {}/{}'.format(test_results.count(True), len(test_results)))
 
-    return
     # create database object
     pi_sql = Database()
 
     try:
-        pi_sql.start(timeout=30*60, silent=False)
+        pi_sql.start(timeout=30*60, silent=False, disable_sql=True)
     except KeyboardInterrupt:
         pi_sql.stop()
     finally:

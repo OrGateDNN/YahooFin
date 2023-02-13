@@ -65,6 +65,17 @@ class thread_print():
         return dt.now().strftime("%H:%M:%S.%f")[:-3]
 
 
+def print_subitems(obj):
+    print()
+
+    try:
+        for key in obj.keys():
+            print("obj::{}: {}".format(key, obj[key]))
+    except (AttributeError, ) as e:
+        for item in obj:
+            print("obj::{}".format(item))
+
+
 class bcolors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'

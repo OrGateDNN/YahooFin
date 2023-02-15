@@ -7,10 +7,12 @@ import numpy as np
 import re
 import math
 import queue
+from datetime import datetime as dt
 from threading import Thread
 
 # scrapping requests
 import wikipedia
+import yfinance
 from bs4 import BeautifulSoup
 import psycopg2
 import psycopg2.extras
@@ -18,14 +20,10 @@ import pyasx.data.companies
 #from tqdm import tqdm
 
 # import local files
-from util import ThreadSafeFlag, ThreadSafeCounter, Queue, bcolors, thread_print
-from yahoo_interface import yfin_obj, yquery_obj
-
-import yfinance
+from util import ThreadSafeFlag, ThreadSafeCounter, Queue, bcolors, thread_print, millify
 from yahoo_interface import yfin_obj, yquery_obj
 
 HourlyLimit = 180
-
 _discount_rate = 0.15
 _growth_perpetuity = 0.025
 
@@ -40,6 +38,15 @@ class FailedTickerAnalysis(Exception):
         super().__init__(self.message)
 
 
+class APIDown(Exception):
+    "Raised on both APIs failing"
+
+    def __init__(self, message=""):
+        self.message = message
+
+        super().__init__(self.message)
+
+
 class Database:
     def __init__(self, collector_pool_size: int = 1):
         self.database = "invest_simple"
@@ -47,6 +54,9 @@ class Database:
         self.user = "pi"  # "interface_account"
         self.password = "actionN06"
         self.port = "5432"
+
+        self.use_yfinance = True
+        self.disable_sql = False
 
         # define connection and cursor for later use
         self.connection = None
@@ -104,6 +114,47 @@ class Database:
         # if self.conn is not None: self.conn.close()
         return connection, cursor
 
+    def verify_api(self):
+        ticker = 'MSFT'
+        print('testing YahooFin and YahooQuery api modules')
+
+        try:
+            t_yahoofin = yfin_obj(ticker)
+            results1 = t_yahoofin.verify_functionality()
+        except Exception as e:
+            results1 = 0
+
+        if results1 < 1:
+            print("\tYahooFin module failed (test={}%)".format(results1))
+        else:
+            print("\tYahooFin module passed")
+
+        print('\t\tdelay {}s for api'.format(self._max_query_per_sec))
+        time.sleep(self._max_query_per_sec)
+
+        try:
+            t_yahooquery = yquery_obj(ticker)
+            results2 = t_yahooquery.verify_functionality()
+        except Exception as e:
+            results2 = 0
+
+        if results2 < 1:
+            print("\tYahooQuery module failed (test={}%)".format(results2))
+        else:
+            print("\tYahooQuery module passed")
+
+        if results1 >= 1:
+            print("setting api to YahooFin")
+            self.use_yfinance = True
+        elif results2 >= 1:
+            print("setting api to YahooQuery")
+            self.use_yfinance = False
+        else:
+            print("Both apis failed, raising API down exception")
+            raise APIDown(message="YFin {}/{} passed | YQuery {}/{} passed".format(
+                round(4*results1), 4,
+                round(4*results2), 4))
+
     def setup(self):
         # setup queues
         self.queues['ticker_list'] = queue.Queue()
@@ -141,7 +192,8 @@ class Database:
         self.threads['Logger'] = Thread(target=self.logger,
                                         args=(self.flags['logger_exit_flag'], self.queues['message_logs'],))
 
-    def start(self, timeout: int = -1, silent=False):
+    def start(self, timeout: int = -1, silent=False, disable_sql=False):
+        self.disable_sql = disable_sql
         self.setup()
 
         # for simplicity
@@ -250,11 +302,10 @@ class Database:
                 self.msg(msg_queue, 'FinderProcess', 'FinderProcess: refreshed new hke items', nowait=True)
 
             if time.time() >= update_refresh:
-                ticker_list = [('NXT.ax',), ('GOOG',)]
+                ticker_list = [('PME.ax',), ('GOOG',)]
                 ticker_list = ticker_list + self.query("SELECT id FROM unanalysed_tickers ORDER BY marketcap DESC", cursor=cursor)
                 ticker_list = ticker_list + self.update_stock_refresh_list(cursor=cursor)
-                # ticker_list = list(reversed(ticker_list))
-                update_refresh = time.time() + (5 * 60)
+                update_refresh = time.time() + (120 * 60)
                 prefetched_tasks.set(len(ticker_list))
                 self.msg(msg_queue, 'FinderProcess', 'FinderProcess: refreshed new tickers list', nowait=True)
 
@@ -304,17 +355,20 @@ class Database:
             cashflow = None
 
             try:
-                stock = self.get_yahoo_finance_data(ticker)
-                info = stock.info  # dict
-                cashflow = stock.cash_flow  # _pd.DataFrame
+                if self.use_yfinance:
+                    stock = yfin_obj(ticker)
+                else:
+                    stock = yquery_obj(ticker)
+
+                # preload data??
+                stock.info  # dict
+                stock.stats  # dict
+                stock.cashflow  # _pd.DataFrame
 
                 msg_list.append((ticker, '\t\tCollect Info Successful'))
 
-                # package up data to send to evaluator
-                data_package = (ticker, info, stock, cashflow)
-
                 # output data
-                data_out_queue.put(data_package)
+                data_out_queue.put(stock)
             except TypeError as e:
                 self.err_print(function='collector', msg='Failed to get cashflow', error=e)
                 msg_list.append(
@@ -325,10 +379,11 @@ class Database:
                     #self.msg(msg_queue, 'Error', 'unable to get cashflow', nowait=True)
                     self.err_print(function='collector', msg='YFinance Failure: yfinance failed to decrypt Yahoo data response', error=e)
 
-                    data_out_queue.put((ticker, info, stock, cashflow))
+                    data_out_queue.put(stock)
                 else:
                     print(e)
                     self.msg(msg_queue, 'UnexpectedError', 'unexpected error received, exiting softly', nowait=True)
+                    self.err_print("Collector", msg="unexpected error", error=e)
                     self.flags['e_stop_flag'].set(True)
                     return
 
@@ -355,24 +410,24 @@ class Database:
                 return
 
             try:
-                data = data_queue.get(timeout=0.5)
+                stock = data_queue.get(timeout=0.5)
+                ticker = stock.ticker
+                info = stock.info
+                stats = stock.stats
+                cashflow = stock.cashflow
             except queue.Empty:
                 continue
 
             ticker_failed = False
 
-            # else continue standard procedure. Extract expected data
-            ticker, info, stock, cashflow = data
-
             try:
                 # filter and consolidate cashflow info into clean useable data
-                cashflow_statement = self.process_cashflow_data(ticker, cashflow, msg_queue=msg_queue)
+                cashflow_statement = self.simple_cashflow_for_sql(ticker, cashflow, msg_queue=msg_queue)
 
                 # write each annual cashflow statement to database [optimisation available to write all at once]
                 for date in cashflow_statement:
                     annual_cf = cashflow_statement[date]
-                    self.write_cashflow(ticker, date.year, *annual_cf, msg_queue, cursor=cursor,
-                                        connection=connection)
+                    self.write_cashflow(ticker, date.year, *annual_cf, msg_queue, cursor=cursor, connection=connection)
 
                 # next, evaluate results and determine new intrinsic value
                 self.evaluate_intrinsic_value(ticker, msg_queue, connection=connection, cursor=cursor)
@@ -382,11 +437,11 @@ class Database:
                 ticker_failed = e.stock_anaylsis_failure
             finally:
                 # stock now successfully updated
-                self.update_stock_status(ticker=ticker, stock_info=info, stock=stock, failed=ticker_failed,
+                self.update_stock_status(ticker=ticker, stock=stock, failed=ticker_failed,
                                          msg_queue=msg_queue, connection=connection, cursor=cursor)
 
                 # finally pass ticker back to finder function to mark off as complete
-                self.remove_unanalysed_stock(ticker, msg_queue, cursor=cursor)
+                self.remove_unanalysed_stock(ticker, msg_queue, cursor=cursor, connection=connection)
 
                 self.msg(msg_queue, ticker, Queue.MsgDone)
                 # mark current data queue item as done
@@ -498,14 +553,15 @@ class Database:
                  VALUES(%s, %s, %s, %s, %s) returning id, year;"""
 
         try:
-            # run query
-            cursor.execute(sql, cashflow_data)
+            if not self.disable_sql:
+                # run query
+                cursor.execute(sql, cashflow_data)
 
-            # get first result of query
-            rs = cursor.fetchall()
+                # get first result of query
+                rs = cursor.fetchall()
 
-            # commit changes
-            connection.commit()
+                # commit changes
+                connection.commit()
         except psycopg2.errors.UniqueViolation as e:
             msg = 'Key (id, year)=({0}, {1}) already exists.'.format(ticker, year)
             self.err_print(function='write_cashflow', msg=msg, error=e, ticker=ticker, msg_queue=msg_queue, msg_only=True)
@@ -752,16 +808,18 @@ class Database:
 
         return self.query(sql, cursor=cursor)
 
-    def remove_unanalysed_stock(self, ticker, msg_queue, cursor):
+    def remove_unanalysed_stock(self, ticker, msg_queue, cursor, connection):
         sql = "DELETE FROM unanalysed_tickers WHERE id='{0}' RETURNING id;"
 
         self.msg(msg_queue, ticker, '\tremoving {0} from unanalysed stocks'.format(ticker))
 
-        result = self.query(sql.format(ticker), cursor=cursor)
-        if len(result) > 0:
-            self.msg(msg_queue, ticker, '\t\tsuccessfully removed item from sql table')
-        else:
-            self.msg(msg_queue, ticker, '\t\tfailed to remove item from sql table')
+        if not self.disable_sql:
+            result = self.query_write(sql.format(ticker), connection=connection, cursor=cursor)
+
+            if len(result) > 0:
+                self.msg(msg_queue, ticker, '\t\tsuccessfully removed item from sql table')
+            else:
+                self.msg(msg_queue, ticker, '\t\tfailed to remove item from sql table')
 
     def get_cashflow(self, ticker, cursor, msg_queue):
         sql = "SELECT year, operating_cashflow, cap_expenditure, freecashflow FROM cashflow WHERE id='{0}' ORDER BY year;"
@@ -795,37 +853,29 @@ class Database:
 
         return formatted_cashflow
 
-    def get_stock_info(self, ticker, stock_info, stock, cursor, msg_queue):
+    def get_stock_info(self, ticker, stock, cursor, msg_queue):
+        stock_info = stock.info
+        stock_stats = stock.stats
+
         if stock_info is not None:
-            # get stock name
-            name = stock_info.get('longName', 'NA') or 'NA'
-
-            # get stock sector
-            sector = stock_info.get('sector', 'NA')
-            # get current stock market price
-            try:
-                market_price = stock.history(period='1d', )['Close'].iloc[-1]
-            except Exception as e:
-                msg = 'Failed to get market price data from stock.history'
-                self.err_print(function='get_stock_info', msg=msg, error=e, ticker=ticker, msg_queue=msg_queue,
-                               msg_only=False)
-                market_price = -1
-
-            # get number of outstanding shares
-            shares_outstanding = stock_info.get('sharesOutstanding', -1)
-            if shares_outstanding is None: shares_outstanding = -1
-
-            # calculate market capitalisation using cap = shares*price
-            if shares_outstanding > 0:
-                market_cap = int(shares_outstanding * market_price / 1000000)
-                stock_shares_outstanding = int(round(shares_outstanding / 1000))
-            else:
-                market_cap = -1
+            name = stock_info.get('name')
         else:
-            name = 'NA'
-            sector = 'NA'
+            name = "NA"
+
+        if stock_stats is not None:
+            sector = stock_info.get('sector')
+            market_price = stock_stats.get('market_price')
+            shares_outstanding = stock_stats.get('shares_outstanding')
+            market_cap = stock_stats.get('market_cap')
+        else:
+            sector = "NA"
+            market_price = -1
             shares_outstanding = -1
             market_cap = -1
+
+
+        if market_cap != -1:
+            market_cap = int(market_cap / 1000000)
 
         # query update attempts for ticker (to determine existance in table and failure count if applicable)
         failure_count = self.query("SELECT update_attempts FROM ticker WHERE id='{0}'".format(ticker), cursor=cursor)
@@ -956,17 +1006,41 @@ class Database:
             values_2 = (*g1_growth, *g2_growth, *g3_growth, *intrinsic, ticker)
 
         # update ticker table and intrinsic value table
-        results_1 = self.query_write(sql_1, connection, cursor, values_1)
-        results_2 = self.query_write(sql_2, connection, cursor, values_2)
+        if not self.disable_sql:
+            results_1 = self.query_write(sql_1, connection, cursor, values_1)
+            results_2 = self.query_write(sql_2, connection, cursor, values_2)
 
-        if len(results_2) > 0:
-            self.msg(msg_queue, ticker, '\tsuccessfully updated intrinsic value evaluation')
-        else:
-            self.msg(msg_queue, ticker, '\t{}failed{} to update intrinsic value evaluation'.format(bcolors.FAIL, bcolors.ENDC))
+            if len(results_2) > 0:
+                self.msg(msg_queue, ticker, '\tsuccessfully updated intrinsic value evaluation')
+            else:
+                self.msg(msg_queue, ticker, '\t{}failed{} to update intrinsic value evaluation'.format(bcolors.FAIL, bcolors.ENDC))
 
-    def update_stock_status(self, ticker, stock_info, stock, failed, msg_queue, connection, cursor, comment=''):
+    def simple_cashflow_for_sql(self, ticker: str, cashflow: pd.DataFrame, msg_queue):
+        """reduce all values by 1000 and ensure no unexpected or null values"""
+        # if no result was returned
+        if cashflow is None or cashflow.empty:
+            msg = '\tUpdate ERR: {0} cashflow statement empty, ignore and continue'.format(ticker)
+            self.err_print(function='process_cashflow_data', msg=msg, error=None, ticker=ticker, msg_queue=msg_queue,
+                           msg_only=True)
+            raise FailedTickerAnalysis
+
+        # if any null values, return bad data
+        if cashflow.isnull().values.any():
+            print(f'\tERR: null values detected in cashflow data for {ticker}')
+            raise FailedTickerAnalysis
+
+        # divide everything by 1000 (we dont care about that level of precision)
+        cashflow = cashflow / 1000
+
+        # if the company's numbers are larger than max integer size, then don't write values to database
+        if (cashflow.abs() > 2147483647).any().any():
+            print('Revenue above integer capacity for ticker: {}'.format(ticker))
+            raise FailedTickerAnalysis
+
+        return cashflow
+
+    def update_stock_status(self, ticker, stock, failed, msg_queue, connection, cursor, comment=''):
         name, sector, shares_outstanding, market_cap, existing_in_sql, failure_count = self.get_stock_info(ticker,
-                                                                                                           stock_info,
                                                                                                            stock,
                                                                                                            cursor=cursor,
                                                                                                            msg_queue=msg_queue)
@@ -997,8 +1071,10 @@ class Database:
             sql = """UPDATE ticker SET last_update=CURRENT_DATE, update_attempts=%s, comment=%s WHERE id=%s RETURNING id;"""
             values = (failure_count, comment, ticker)
 
-        result = self.query_write(sql, connection, cursor, values)
+        if not self.disable_sql:
+            result = self.query_write(sql, connection, cursor, values)
 
+    # SUPERCEDED AND UNUSED
     def process_cashflow_data(self, ticker: str, cashflow: pd.DataFrame, msg_queue) -> pd.DataFrame:
         if cashflow is None or cashflow.empty:
             msg = '\tUpdate ERR: {0} cashflow statement empty, ignore and continue'.format(ticker)
@@ -1200,56 +1276,7 @@ def yfinance_func_test():
         hist = msft.cashflow
         print('cashflow {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
         results.append(True)
-    except Exception as e:
-        print('{}failed{} on cashflow'.format(bcolors.FAIL, bcolors.ENDC))
-        results.append(False)
-
-    try:
-        hist = msft.history(period="1mo")
-        print('history {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
-        results.append(True)
-    except Exception as e:
-        print('{}failed{} on history'.format(bcolors.FAIL, bcolors.ENDC))
-        results.append(False)
-
-    return results
-
-
-def yquery_func_test():
-    results = []
-
-    try:
-        msft = yahooquery.Ticker("PME.ax")
-        print('ticker {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
-        results.append(True)
-    except Exception as e:
-        print('{}failed{} on ticker'.format(bcolors.FAIL, bcolors.ENDC))
-        results.append(False)
-
-    print(msft.asset_profile)
-    #print(msft.summary_detail)
-    #print(msft.cash_flow())
-    exit()
-    try:
-        msft.info
-        print('info {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
-        results.append(True)
-    except Exception as e:
-        print('{}failed{} on info'.format(bcolors.FAIL, bcolors.ENDC))
-        results.append(False)
-
-    try:
-        msft.fast_info
-        print('fast info {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
-        results.append(True)
-    except Exception as e:
-        print('{}failed{} on fast info'.format(bcolors.FAIL, bcolors.ENDC))
-        results.append(False)
-
-    try:
-        hist = msft.cashflow
-        print('cashflow {}passed{}'.format(bcolors.OKGREEN, bcolors.ENDC))
-        results.append(True)
+        print(msft.cashflow)
     except Exception as e:
         print('{}failed{} on cashflow'.format(bcolors.FAIL, bcolors.ENDC))
         results.append(False)
@@ -1277,10 +1304,16 @@ def main():
     pi_sql = Database()
 
     try:
-        pi_sql.start(timeout=30*60, silent=False, disable_sql=True)
+        print('verifying API')
+        pi_sql.verify_api()
+        print('starting threads')
+        pi_sql.start(timeout=90*60, silent=False, disable_sql=False)
+    except APIDown:
+        print('no APIs available, closing program')
     except KeyboardInterrupt:
-        pi_sql.stop()
+        print('received keyboard shortcut. stopping program')
     finally:
+        pi_sql.stop()
         print('Program finished')
 
 
